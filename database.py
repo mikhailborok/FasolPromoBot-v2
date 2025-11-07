@@ -310,3 +310,78 @@ def get_admin(login, password):
     conn.close()
     # Возвращаем кортеж для совместимости с предыдущим кодом
     return tuple(admin) if admin else None
+
+    # Добавить в database.py после существующих функций
+
+def create_store(city, address, name):
+    """Создание нового магазина"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Проверяем, нет ли уже магазина с такими данными
+    cursor.execute("""
+        SELECT id FROM stores 
+        WHERE city = ? AND address = ? AND name = ?
+    """, (city, address, name))
+    
+    existing_store = cursor.fetchone()
+    if existing_store:
+        conn.close()
+        return None  # Магазин уже существует
+    
+    # Создаем новый магазин
+    cursor.execute("""
+        INSERT INTO stores (city, address, name) 
+        VALUES (?, ?, ?)
+    """, (city, address, name))
+    
+    store_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    return store_id
+
+def create_store_admin(login, password, store_id):
+    """Создание администратора для магазина"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Проверяем, нет ли уже администратора с таким логином
+    cursor.execute("SELECT id FROM admins WHERE login = ?", (login,))
+    existing_admin = cursor.fetchone()
+    if existing_admin:
+        conn.close()
+        return False  # Логин уже занят
+    
+    # Создаем администратора магазина
+    password_hash = hashlib.sha256(password.encode()).hexdigest()
+    cursor.execute("""
+        INSERT INTO admins (login, password_hash, role, store_id) 
+        VALUES (?, ?, 'store', ?)
+    """, (login, password_hash, store_id))
+    
+    conn.commit()
+    conn.close()
+    return True
+
+def delete_store(store_id):
+    """Удаление магазина и связанных данных"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    try:
+        # Удаляем связанные записи в правильном порядке
+        cursor.execute("DELETE FROM user_coupons WHERE promotion_id IN (SELECT id FROM promotions WHERE store_id = ?)", (store_id,))
+        cursor.execute("DELETE FROM promotions WHERE store_id = ?", (store_id,))
+        cursor.execute("DELETE FROM admins WHERE store_id = ?", (store_id,))
+        cursor.execute("UPDATE users SET store_id = NULL WHERE store_id = ?", (store_id,))
+        cursor.execute("DELETE FROM stores WHERE id = ?", (store_id,))
+        
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        print(f"Ошибка при удалении магазина: {e}")
+        return False

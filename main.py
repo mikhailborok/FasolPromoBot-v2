@@ -11,7 +11,7 @@ from io import BytesIO
 from datetime import datetime, timedelta
 import sqlite3
 import re
-from database import init_db, get_user, create_user, get_stores, get_store, get_promotions, create_promotion, get_user_coupon, create_coupon, redeem_coupon_by_code, get_admin, get_db_connection
+from database import init_db, get_user, create_user, get_stores, get_store, get_promotions, create_promotion, get_user_coupon, create_coupon, redeem_coupon_by_code, get_admin, get_db_connection, create_store, create_store_admin, delete_store
 from config import BOT_TOKEN
 
 # Настройка логирования
@@ -307,11 +307,24 @@ async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now().date().isoformat()
     conn = sqlite3.connect('fasoley_bot.db')
     cursor = conn.cursor()
+    
+    # Сначала находим правильный user_id (id из таблицы users)
+    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,))
+    user_row = cursor.fetchone()
+    
+    if not user_row:
+        conn.close()
+        await update.message.reply_text("❌ Ошибка: пользователь не найден")
+        return
+        
+    correct_user_id = user_row[0]
+    
+    # Теперь проверяем купоны по правильному user_id
     cursor.execute("""
         SELECT 1 FROM user_coupons 
         WHERE user_id = ? AND DATE(created_at) = ?
         LIMIT 1
-    """, (user_id, today))
+    """, (correct_user_id, today))
     existing_coupon_today = cursor.fetchone()
     
     if existing_coupon_today:
@@ -374,25 +387,15 @@ async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def my_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать мои купоны"""
-    telegram_id = update.effective_user.id
-    store_id = get_user(telegram_id)
+    user_id = update.effective_user.id
+    store_id = get_user(user_id)
     if not store_id:
         await update.message.reply_text("❌ Сначала выберите магазин!")
         return
 
     conn = sqlite3.connect('fasoley_bot.db')
     cursor = conn.cursor()
-
-    # 🔹 Сначала получаем внутренний user_id из таблицы users по telegram_id
-    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,))
-    user_row = cursor.fetchone()
-    if not user_row:
-        conn.close()
-        await update.message.reply_text("❌ Вы ещё не зарегистрированы в системе. Получите акцию, чтобы появиться в базе.")
-        return
-    user_id = user_row[0]  # Это users.id
-
-    # 🔹 Теперь ищем купоны по user_id (внутреннему ID)
+    # НОВЫЙ запрос: получаем также valid_days из акции
     cursor.execute("""
         SELECT uc.coupon_code, p.description, s.name, s.address, uc.created_at, p.valid_days
         FROM user_coupons uc
@@ -414,14 +417,16 @@ async def my_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         store_name = coupon[2]
         store_address = coupon[3]
         created_at = datetime.strptime(coupon[4], '%Y-%m-%d %H:%M:%S').date()
-        valid_days = coupon[5]
+        valid_days = coupon[5] # Получаем valid_days
+        # ВЫЧИСЛЯЕМ дату истечения срока действия
         valid_until = created_at + timedelta(days=valid_days)
+
         await update.message.reply_text(
             f"🎁 {description}\n"
             f"🏪 \"Фасоль\", {store_address}\n"
             f"🔢 Код: <b>{coupon_code}</b>\n"
             f"📅 Дата получения: {created_at.strftime('%d.%m.%Y')}\n"
-            f"⏳ Купон можно погасить до: {valid_until.strftime('%d.%m.%Y')}",
+            f"⏳ Купон можно погасить до: {valid_until.strftime('%d.%m.%Y')}\n", # НОВАЯ СТРОКА
             parse_mode="HTML"
         )
 
@@ -476,7 +481,7 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, a
     if role == "master":
         keyboard = [
             [KeyboardButton("📊 Общая статистика"), KeyboardButton("🎁 Управление акциями")],
-            [KeyboardButton("🔙 Выйти из админки")]
+            [KeyboardButton("🏪 Управление магазинами"), KeyboardButton("🔙 Выйти из админки")]
         ]
         welcome_text = f"🔧 МАСТЕР-ПАНЕЛЬ\n\nДобро пожаловать, {admin[1]}!"
     else:
@@ -731,8 +736,10 @@ async def show_my_promotions(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user_id not in ADMIN_SESSIONS:
         await update.message.reply_text("❌ Сначала войдите в админ-панель")
         return
+
     admin = ADMIN_SESSIONS[user_id]
     role = admin[3]
+
     if role == "master":
         if user_id not in MASTER_ADMIN_SELECTED_STORE:
             await update.message.reply_text("❌ Магазин не выбран.")
@@ -746,19 +753,39 @@ async def show_my_promotions(update: Update, context: ContextTypes.DEFAULT_TYPE)
         promotions = get_promotions(store_id)
         store = get_store(store_id)
         title = f"🎁 <b>Акции магазина {store['name']}</b>"
-    
+
     if not promotions:
         await update.message.reply_text("📝 Акций пока нет")
         if role == "master" and user_id in MASTER_ADMIN_SELECTED_STORE:
-            await show_selected_store_menu(update, context, store_id)
+             await show_selected_store_menu(update, context, store_id)
         return
 
-    # ✅ Инициализируем ДО цикла и после return
-    promo_text = f"{title}\n"
-
+    # Подключаемся к БД для подсчета выданных и погашенных купонов
+    conn = sqlite3.connect('fasoley_bot.db')
+    cursor = conn.cursor()
+    
+    promo_text = f"{title}\n\n"
     for promo in promotions:
-        # Распаковка: 8 полей
+        # ОБНОВЛЕННАЯ РАСПАКОВКА: теперь 8 полей вместо 6
         promo_id, store_id_promo, description, start_date, duration, max_coupons, valid_days, created_at = promo
+        
+        # ПОДСЧЕТ ВЫДАННЫХ КУПОНОВ ДЛЯ ЭТОЙ АКЦИИ
+        cursor.execute("""
+            SELECT COUNT(*) FROM user_coupons 
+            WHERE promotion_id = ?
+        """, (promo_id,))
+        issued_coupons = cursor.fetchone()[0]
+        
+        # ПОДСЧЕТ ПОГАШЕННЫХ КУПОНОВ ДЛЯ ЭТОЙ АКЦИИ
+        cursor.execute("""
+            SELECT COUNT(*) FROM user_coupons 
+            WHERE promotion_id = ? AND redeemed = 1
+        """, (promo_id,))
+        redeemed_coupons = cursor.fetchone()[0]
+        
+        # РАСЧЕТ ПРОЦЕНТА ПОГАШЕНИЯ
+        redemption_percentage = round((redeemed_coupons / issued_coupons * 100), 1) if issued_coupons else 0
+        
         try:
             start_dt = datetime.strptime(start_date, '%d.%m.%Y').date()
         except ValueError:
@@ -766,37 +793,32 @@ async def show_my_promotions(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 start_dt = datetime.strptime(start_date, '%Y-%m-%d').date()
             except ValueError:
                 continue
+        
         end_dt = start_dt + timedelta(days=duration)
         today = datetime.now().date()
         status = "🟢 Активна" if start_dt <= today <= end_dt else "🔴 Неактивна"
-
-        # 🔹 Получаем количество выданных купонов по этой акции
-        conn = sqlite3.connect('fasoley_bot.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM user_coupons WHERE promotion_id = ?", (promo_id,))
-        issued_coupons = cursor.fetchone()[0]
-        conn.close()
-
-        # 🔹 Формируем строку лимита
-        if max_coupons > 0:
-            limit_info = f"{issued_coupons} из {max_coupons}"
-        else:
-            limit_info = f"{issued_coupons} (без лимита)"
-
+        
+        # ОБНОВЛЕННАЯ ИНФОРМАЦИЯ С ДОБАВЛЕНИЕМ ПОГАШЕННЫХ КУПОНОВ
         promo_text += (
             f"ID: {promo_id}\n"
             f"🎁 Описание: {description}\n"
-            f"📅 Период акции: {start_dt.strftime('%d.%m.%Y')} – {end_dt.strftime('%d.%m.%Y')}\n"
-            f"📊 Выдано купонов: {limit_info}\n"
+            f"📅 Период акции: {start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}\n"
+            f"📊 Макс. купонов: {max_coupons if max_coupons > 0 else '∞'}\n"
+            f"📨 Выдано купонов: {issued_coupons}\n"
+            f"✅ Погашено: {redeemed_coupons}\n"  # <-- НОВАЯ СТРОКА
+            f"📈 Процент погашения: {redemption_percentage}%\n"  # <-- НОВАЯ СТРОКА
             f"⏳ Срок действия купона: {valid_days} дн.\n"
             f"📊 Статус: {status}\n"
             "━━━━━━━━━━━━━━━━\n"
         )
-
+    
+    conn.close()
+    
     await update.message.reply_text(text=promo_text, parse_mode="HTML")
+    
     # Для мастер-админа после показа списка акций показываем меню управления
     if role == "master" and user_id in MASTER_ADMIN_SELECTED_STORE:
-        await show_selected_store_menu(update, context, store_id)
+         await show_selected_store_menu(update, context, store_id)
 
 async def add_promotion_start_for_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Начало добавления акции мастер-админом для выбранного магазина"""
@@ -903,6 +925,101 @@ async def delete_promotion_start(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(promo_text, reply_markup=reply_markup)
     USER_STATES[user_id] = "deleting_promotion"
 
+# ========== НОВЫЕ ФУНКЦИИ ДЛЯ УПРАВЛЕНИЯ МАГАЗИНАМИ ==========
+
+async def manage_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Управление магазинами для мастер-админа"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_SESSIONS or ADMIN_SESSIONS[user_id][3] != "master":
+        await update.message.reply_text("❌ Доступ запрещен.")
+        return
+
+    keyboard = [
+        [KeyboardButton("➕ Добавить магазин"), KeyboardButton("🗑 Удалить магазин")],
+        [KeyboardButton("📋 Список магазинов"), KeyboardButton("🔙 Назад")]
+    ]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "🏪 УПРАВЛЕНИЕ МАГАЗИНАМИ\n\n"
+        "Выберите действие:",
+        reply_markup=reply_markup
+    )
+
+async def add_store_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало добавления магазина"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_SESSIONS or ADMIN_SESSIONS[user_id][3] != "master":
+        await update.message.reply_text("❌ Доступ запрещен.")
+        return
+
+    keyboard = [[KeyboardButton("🔙 Назад")]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    await update.message.reply_text(
+        "🏪 ДОБАВЛЕНИЕ МАГАЗИНА\n\n"
+        "Шаг 1 из 5: Введите город магазина\n"
+        "Например: Москва",
+        reply_markup=reply_markup
+    )
+    USER_STATES[user_id] = "adding_store_city"
+
+async def delete_store_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Начало удаления магазина"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_SESSIONS or ADMIN_SESSIONS[user_id][3] != "master":
+        await update.message.reply_text("❌ Доступ запрещен.")
+        return
+
+    stores = get_stores()
+    if not stores:
+        await update.message.reply_text("❌ Нет магазинов для удаления")
+        return
+
+    keyboard = [[KeyboardButton("🔙 Назад")]]
+    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+    
+    store_text = "🗑 УДАЛЕНИЕ МАГАЗИНА\n\nВведите ID магазина для удаления:\n\n"
+    for store in stores:
+        store_text += f"ID: {store['id']} - {store['city']}, {store['address']} ({store['name']})\n"
+    
+    await update.message.reply_text(store_text, reply_markup=reply_markup)
+    USER_STATES[user_id] = "deleting_store"
+
+async def list_stores(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать список всех магазинов"""
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_SESSIONS or ADMIN_SESSIONS[user_id][3] != "master":
+        await update.message.reply_text("❌ Доступ запрещен.")
+        return
+
+    stores = get_stores()
+    if not stores:
+        await update.message.reply_text("📝 Магазинов пока нет")
+        return
+
+    store_text = "📋 СПИСОК МАГАЗИНОВ\n\n"
+    for store in stores:
+        # Получаем информацию об администраторе магазина
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT login FROM admins WHERE store_id = ? AND role = 'store'", (store['id'],))
+        admin = cursor.fetchone()
+        conn.close()
+        
+        admin_login = admin['login'] if admin else "❌ Не назначен"
+        
+        store_text += (
+            f"🏪 <b>ID: {store['id']}</b>\n"
+            f"🏙 Город: {store['city']}\n"
+            f"📍 Адрес: {store['address']}\n"
+            f"📛 Название: {store['name']}\n"
+            f"👨‍💼 Админ: {admin_login}\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+        )
+
+    await update.message.reply_text(store_text, parse_mode="HTML")
+
 async def cancel_current_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отмена текущего действия"""
     user_id = update.effective_user.id
@@ -947,7 +1064,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                     
                 # Если пользователь находился на этапе добавления акции
-                elif state in ["adding_promotion_description", "adding_promotion_date", "adding_promotion_duration"]:
+                elif state in ["adding_promotion_description", "adding_promotion_date", "adding_promotion_duration", "adding_promotion_max_coupons", "adding_promotion_valid_days"]:
                     if user_id in USER_STATES:
                         del USER_STATES[user_id]
                     # Возвращаем в админ-панель
@@ -978,6 +1095,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      store_id = MASTER_ADMIN_SELECTED_STORE[user_id]
                      await show_selected_store_menu(update, context, store_id)
                      return
+                
+                # === НОВАЯ ЛОГИКА ДЛЯ УПРАВЛЕНИЯ МАГАЗИНАМИ ===
+                elif state in ["adding_store_city", "adding_store_address", "adding_store_name", 
+                              "adding_store_admin_login", "adding_store_admin_password", 
+                              "deleting_store", "confirm_store_deletion"]:
+                    if user_id in USER_STATES:
+                        del USER_STATES[user_id]
+                    await manage_stores(update, context)
+                    return
+                # === КОНЕЦ НОВОЙ ЛОГИКИ ===
                      
                 # Для всех остальных состояний админа просто удаляем состояние и возвращаем в админ-панель
                 else:
@@ -1166,7 +1293,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 USER_STATES[user_id] = "adding_promotion_max_coupons"
             except ValueError:
                 await update.message.reply_text("❌ Введите число (количество дней)")
-
         elif state == "adding_promotion_max_coupons":
             try:
                 max_coupons = int(text)
@@ -1184,7 +1310,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 USER_STATES[user_id] = "adding_promotion_valid_days"
             except ValueError:
                 await update.message.reply_text("❌ Введите число (0 или больше)")
-
         elif state == "adding_promotion_valid_days":
             try:
                 valid_days = int(text)
@@ -1259,6 +1384,133 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await update.message.reply_text(success_msg)
             except ValueError:
                 await update.message.reply_text("❌ Введите корректный ID акции")
+
+        # ========== НОВЫЕ СОСТОЯНИЯ ДЛЯ УПРАВЛЕНИЯ МАГАЗИНАМИ ==========
+        elif state == "adding_store_city":
+            context.user_data['store_city'] = text
+            await update.message.reply_text(
+                "📍 Шаг 2 из 5: Введите адрес магазина\n"
+                "Например: ул. Ленина, 15"
+            )
+            USER_STATES[user_id] = "adding_store_address"
+
+        elif state == "adding_store_address":
+            context.user_data['store_address'] = text
+            await update.message.reply_text(
+                "📛 Шаг 3 из 5: Введите название магазина\n"
+                "Например: Фасоль Москва-3"
+            )
+            USER_STATES[user_id] = "adding_store_name"
+
+        elif state == "adding_store_name":
+            context.user_data['store_name'] = text
+            await update.message.reply_text(
+                "👨‍💼 Шаг 4 из 5: Введите логин для администратора магазина\n"
+                "Например: m3"
+            )
+            USER_STATES[user_id] = "adding_store_admin_login"
+
+        elif state == "adding_store_admin_login":
+            context.user_data['store_admin_login'] = text
+            await update.message.reply_text(
+                "🔐 Шаг 5 из 5: Введите пароль для администратора магазина\n"
+                "Например: m3"
+            )
+            USER_STATES[user_id] = "adding_store_admin_password"
+
+        elif state == "adding_store_admin_password":
+            # Получаем все данные
+            city = context.user_data['store_city']
+            address = context.user_data['store_address']
+            name = context.user_data['store_name']
+            login = context.user_data['store_admin_login']
+            password = text
+
+            # Создаем магазин
+            store_id = create_store(city, address, name)
+            
+            if store_id is None:
+                await update.message.reply_text("❌ Магазин с такими данными уже существует!")
+                del USER_STATES[user_id]
+                await manage_stores(update, context)
+                return
+
+            # Создаем администратора
+            admin_created = create_store_admin(login, password, store_id)
+            
+            if not admin_created:
+                # Если не удалось создать администратора, удаляем магазин
+                delete_store(store_id)
+                await update.message.reply_text("❌ Логин администратора уже занят!")
+                del USER_STATES[user_id]
+                await manage_stores(update, context)
+                return
+
+            success_msg = (
+                f"✅ Магазин успешно создан!\n\n"
+                f"🏙 Город: {city}\n"
+                f"📍 Адрес: {address}\n"
+                f"📛 Название: {name}\n"
+                f"🆔 ID магазина: {store_id}\n"
+                f"👨‍💼 Логин админа: {login}\n"
+                f"🔐 Пароль админа: {password}"
+            )
+            
+            # Очищаем состояние и данные
+            del USER_STATES[user_id]
+            context.user_data.clear()
+            
+            await update.message.reply_text(success_msg)
+            await manage_stores(update, context)
+
+        elif state == "deleting_store":
+            try:
+                store_id = int(text)
+                store = get_store(store_id)
+                
+                if not store:
+                    await update.message.reply_text("❌ Магазин не найден")
+                    return
+                
+                # Подтверждение удаления
+                keyboard = [
+                    [KeyboardButton("✅ Да, удалить"), KeyboardButton("❌ Нет, отменить")]
+                ]
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                
+                confirmation_text = (
+                    f"⚠️ ВЫ УДАЛЯЕТЕ МАГАЗИН:\n\n"
+                    f"🏙 Город: {store['city']}\n"
+                    f"📍 Адрес: {store['address']}\n"
+                    f"📛 Название: {store['name']}\n\n"
+                    f"Это действие нельзя отменить!\n"
+                    f"Удалить магазин?"
+                )
+                
+                context.user_data['store_to_delete'] = store_id
+                await update.message.reply_text(confirmation_text, reply_markup=reply_markup)
+                USER_STATES[user_id] = "confirm_store_deletion"
+                
+            except ValueError:
+                await update.message.reply_text("❌ Введите корректный ID магазина")
+
+        elif state == "confirm_store_deletion":
+            if text == "✅ Да, удалить":
+                store_id = context.user_data.get('store_to_delete')
+                if store_id:
+                    success = delete_store(store_id)
+                    if success:
+                        await update.message.reply_text("✅ Магазин успешно удален!")
+                    else:
+                        await update.message.reply_text("❌ Ошибка при удалении магазина")
+            else:
+                await update.message.reply_text("❌ Удаление отменено")
+            
+            # Очищаем состояние и данные
+            del USER_STATES[user_id]
+            context.user_data.clear()
+            await manage_stores(update, context)
+        # ========== КОНЕЦ НОВЫХ СОСТОЯНИЙ ==========
         return
 
     # Обработка кнопок меню
@@ -1290,8 +1542,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if role == "master":
             if text == "📊 Общая статистика":
                 await show_general_stats(update, context)
-            elif text == "📊 Статистика по магазинам":  # ← ДОБАВЬТЕ ЭТУ СТРОКУ
-                await show_store_stats_list(update, context)  # ← ДОБАВЬТЕ ЭТУ СТРОКУ
+            elif text == "📊 Статистика по магазинам":
+                await show_store_stats_list(update, context)
             elif text == "🎁 Управление акциями":
                 await choose_admin_store(update, context)
             # Кнопки внутри меню выбранного магазина
@@ -1303,6 +1555,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await add_promotion_start_for_master(update, context)
             elif text == "❌ Удалить акцию из магазина":
                 await delete_promotion_start_for_master(update, context)
+            # ========== НОВЫЕ КНОПКИ УПРАВЛЕНИЯ МАГАЗИНАМИ ==========
+            elif text == "🏪 Управление магазинами":
+                await manage_stores(update, context)
+            elif text == "➕ Добавить магазин":
+                await add_store_start(update, context)
+            elif text == "🗑 Удалить магазин":
+                await delete_store_start(update, context)
+            elif text == "📋 Список магазинов":
+                await list_stores(update, context)
+            # ========== КОНЕЦ НОВЫХ КНОПОК ==========
         else: # store admin
             if text == "📊 Статистика магазина":
                 await show_store_stats_for_master(update, context) # Используем исправленную функцию
