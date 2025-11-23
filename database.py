@@ -51,8 +51,9 @@ def init_db():
             description TEXT NOT NULL,
             start_date DATE NOT NULL,
             duration INTEGER NOT NULL,
-            max_coupons INTEGER DEFAULT 0,  -- NEW: Макс. количество купонов (0 = без лимита)
-            valid_days INTEGER DEFAULT 1,   -- NEW: Дней на погашение после получения
+            max_coupons INTEGER DEFAULT 0,  -- Макс. количество купонов (0 = без лимита)
+            valid_days INTEGER DEFAULT 1,   -- Дней на погашение после получения
+            starts_today BOOLEAN DEFAULT 1, -- НОВОЕ: Стартует ли акция день в день (1) или на следующий день (0)
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (store_id) REFERENCES stores (id)
         )
@@ -111,13 +112,13 @@ def init_db():
     promo_count = cursor.fetchone()[0]
     
     if promo_count == 0: # Добавляем акции только если их еще нет
-        # Акции (по 3 для каждого магазина) - ИСПРАВЛЕНО: используем точки вместо дефисов
+        # Акции (по 3 для каждого магазина) - с новым полем starts_today
         promotions_data = []
         for store_id in range(1, 5):
             promotions_data.extend([
-                (store_id, "☕ Кофе в подарок", "24.10.2025", 30, 100, 3),  # 100 купонов, 3 дня на погашение
-                (store_id, "📉 Скидка 5% на чек", "24.10.2025", 30, 0, 1),   # Без лимита, 1 день
-                (store_id, "🍭 Конфеты в подарок", "24.10.2025", 30, 50, 7), # 50 купонов, 7 дней
+                (store_id, "☕ Кофе в подарок", "24.10.2025", 30, 100, 3, 1),  # 100 купонов, 3 дня на погашение, старт день в день
+                (store_id, "📉 Скидка 5% на чек", "24.10.2025", 30, 0, 1, 0),   # Без лимита, 1 день, старт на следующий день
+                (store_id, "🍭 Конфеты в подарок", "24.10.2025", 30, 50, 7, 1), # 50 купонов, 7 дней, старт день в день
             ])
         
         for promo in promotions_data:
@@ -127,14 +128,14 @@ def init_db():
                 db_date = date_obj.strftime('%Y-%m-%d')
                 # НОВЫЙ запрос с новыми полями
                 cursor.execute("""
-                    INSERT OR IGNORE INTO promotions (store_id, description, start_date, duration, max_coupons, valid_days) 
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """, (promo[0], promo[1], db_date, promo[3], promo[4], promo[5]))
+                    INSERT OR IGNORE INTO promotions (store_id, description, start_date, duration, max_coupons, valid_days, starts_today) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (promo[0], promo[1], db_date, promo[3], promo[4], promo[5], promo[6]))
             except ValueError:
-                # Если не удалось распарсить, вставляем как есть (старый формат для совместимости)
+                # Если не удалось распарсить, вставляем как есть
                 cursor.execute("""
-                    INSERT OR IGNORE INTO promotions (store_id, description, start_date, duration, max_coupons, valid_days) 
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT OR IGNORE INTO promotions (store_id, description, start_date, duration, max_coupons, valid_days, starts_today) 
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, promo)
 
     conn.commit()
@@ -184,7 +185,34 @@ def get_promotions(store_id=None):
     conn.close()
     return [tuple(row) for row in rows]
 
-def create_promotion(store_id, description, start_date, duration, max_coupons=0, valid_days=1):
+def get_promotions_with_local_ids(store_id=None):
+    """Получить акции с локальными ID для каждого магазина"""
+    conn = get_db_connection()
+    
+    if store_id:
+        # Для конкретного магазина - локальная нумерация с 1
+        query = """
+            SELECT p.*, 
+                   (ROW_NUMBER() OVER (PARTITION BY p.store_id ORDER BY p.id)) as local_id
+            FROM promotions p
+            WHERE p.store_id = ?
+            ORDER BY p.id
+        """
+        rows = conn.execute(query, (store_id,)).fetchall()
+    else:
+        # Для всех магазинов - локальная нумерация в контексте каждого магазина
+        query = """
+            SELECT p.*, 
+                   (ROW_NUMBER() OVER (PARTITION BY p.store_id ORDER BY p.id)) as local_id
+            FROM promotions p
+            ORDER BY p.store_id, p.id
+        """
+        rows = conn.execute(query).fetchall()
+    
+    conn.close()
+    return [dict(row) for row in rows]    
+
+def create_promotion(store_id, description, start_date, duration, max_coupons=0, valid_days=1, starts_today=1):
     # Преобразуем ДД.ММ.ГГГГ в ГГГГ-ММ-ДД для хранения в БД
     try:
         date_obj = datetime.strptime(start_date, '%d.%m.%Y')
@@ -193,20 +221,31 @@ def create_promotion(store_id, description, start_date, duration, max_coupons=0,
         db_date = start_date
     
     conn = get_db_connection()
-    # НОВЫЙ запрос на вставку
+    # НОВЫЙ запрос на вставку с полем starts_today
     conn.execute("""
-        INSERT INTO promotions (store_id, description, start_date, duration, max_coupons, valid_days) 
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (store_id, description, db_date, duration, max_coupons, valid_days))
+        INSERT INTO promotions (store_id, description, start_date, duration, max_coupons, valid_days, starts_today) 
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (store_id, description, db_date, duration, max_coupons, valid_days, starts_today))
     conn.commit()
     conn.close()
     
-def get_user_coupon(user_id, date):
+def get_user_coupon(telegram_id, date):
+    """Получить купон пользователя за определенную дату"""
     conn = get_db_connection()
+    
+    # Сначала находим правильный user_id
+    user_row = conn.execute("SELECT id FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    
+    if not user_row:
+        conn.close()
+        return None
+        
+    correct_user_id = user_row['id']
+    
     coupon = conn.execute("""
         SELECT * FROM user_coupons 
         WHERE user_id = ? AND DATE(created_at) = ? AND redeemed = 0
-    """, (user_id, date)).fetchone()
+    """, (correct_user_id, date)).fetchone()
     conn.close()
     return dict(coupon) if coupon else None
 
@@ -251,7 +290,8 @@ def redeem_coupon_by_code(code, user_id):
         uc.*, 
         p.description, 
         p.store_id,
-        p.valid_days,          -- ← ДОБАВЛЕНО
+        p.valid_days,
+        p.starts_today,        -- ← ДОБАВЛЕНО
         s.name, 
         s.address, 
         s.city, 
@@ -310,8 +350,6 @@ def get_admin(login, password):
     conn.close()
     # Возвращаем кортеж для совместимости с предыдущим кодом
     return tuple(admin) if admin else None
-
-    # Добавить в database.py после существующих функций
 
 def create_store(city, address, name):
     """Создание нового магазина"""
@@ -385,3 +423,13 @@ def delete_store(store_id):
         conn.close()
         print(f"Ошибка при удалении магазина: {e}")
         return False
+
+def get_promotion_with_start_type(promotion_id):
+    """Получить информацию об акции с типом старта"""
+    conn = get_db_connection()
+    promotion = conn.execute("SELECT * FROM promotions WHERE id = ?", (promotion_id,)).fetchone()
+    conn.close()
+    return dict(promotion) if promotion else None
+
+
+

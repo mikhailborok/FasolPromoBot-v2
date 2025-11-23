@@ -1,18 +1,21 @@
-# main.py
-import asyncio
+# Упрощенный импорт - сначала базовые импорты
+import sqlite3
+from datetime import datetime, timedelta
 import logging
 import os
 import json
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputFile
-# Убираем WebAppInfo, так как функционал удален
-# from telegram import WebAppInfo
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from io import BytesIO
-from datetime import datetime, timedelta
-import sqlite3
 import re
-from database import init_db, get_user, create_user, get_stores, get_store, get_promotions, create_promotion, get_user_coupon, create_coupon, redeem_coupon_by_code, get_admin, get_db_connection, create_store, create_store_admin, delete_store
+
+# Импорт из telegram
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputFile
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
+
+# Импорт config
 from config import BOT_TOKEN
+
+# Импорт из database - ОДНОЙ СТРОКОЙ
+from database import *
 
 # Настройка логирования
 logging.basicConfig(
@@ -50,7 +53,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         # --- Отправка изображения с подписью ---
-        photo_path = "/content/drive/MyDrive/FasolPromoBotQwen/Fasol_logo.png" # Убедитесь, что путь правильный
+        photo_path = "/content/drive/MyDrive/FasolPromoBotQwen/Fasol.png" # Убедитесь, что путь правильный
         
         # Проверяем, существует ли файл
         if os.path.exists(photo_path):
@@ -92,7 +95,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         # --- Отправка изображения с подписью для нового пользователя ---
-        photo_path = "/content/drive/MyDrive/FasolPromoBotQwen/Fasol_logo.png" # Убедитесь, что путь правильный
+        photo_path = "/content/drive/MyDrive/FasolPromoBotQwen/Fasol.png" # Убедитесь, что путь правильный
         
         # Проверяем, существует ли файл
         if os.path.exists(photo_path):
@@ -292,8 +295,6 @@ async def show_selected_store_menu(update: Update, context: ContextTypes.DEFAULT
     else: # Предполагаем, что это вызов из handle_message
         await update.message.reply_text(menu_text, reply_markup=reply_markup)
 
-# main.py - функция get_promotion
-
 async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Получение акции"""
     user_id = update.effective_user.id
@@ -337,7 +338,7 @@ async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today_date = datetime.now().date()
     
     for promo in promotions:
-        # promo[3] - start_date, promo[4] - duration, promo[5] - max_coupons, promo[6] - valid_days
+        # promo[3] - start_date, promo[4] - duration, promo[5] - max_coupons, promo[6] - valid_days, promo[7] - starts_today
         try:
             start_date = datetime.strptime(promo[3], '%d.%m.%Y').date()
         except ValueError:
@@ -374,12 +375,20 @@ async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Вычисляем дату, до которой можно погасить купон
     valid_until_date = today_date + timedelta(days=selected_promo[6]) # valid_days
     
+    # НОВОЕ: Определяем сообщение о доступности акции
+    starts_today = selected_promo[7] # starts_today
+    if starts_today:
+        availability_message = "✅ Акцией можно воспользоваться уже сейчас!"
+    else:
+        availability_message = "⏳ Акцией можно воспользоваться с завтрашнего дня!"
+    
     await update.message.reply_text(
         f"🎉 Поздравляем! Вы получили акцию в магазине \"Фасоль\":\n\n"
         f"🎁 {selected_promo[2]}\n"
         f"📍 Адрес: {store['address']}\n"
         f"📅 Дата выдачи: {today_date.strftime('%d.%m.%Y')}\n"
-        f"⏳ Купон действителен до: {valid_until_date.strftime('%d.%m.%Y')}\n\n"
+        f"⏳ Купон действителен до: {valid_until_date.strftime('%d.%m.%Y')}\n"
+        f"{availability_message}\n\n"
         f"🔢 Ваш код купона: <b>{coupon_code}</b>\n"
         f"Покажите этот код на кассе для получения скидки/подарка! 📱",
         parse_mode="HTML"
@@ -395,15 +404,28 @@ async def my_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     conn = sqlite3.connect('fasoley_bot.db')
     cursor = conn.cursor()
-    # НОВЫЙ запрос: получаем также valid_days из акции
+    
+    # Сначала находим правильный user_id (id из таблицы users)
+    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,))
+    user_row = cursor.fetchone()
+    
+    if not user_row:
+        conn.close()
+        await update.message.reply_text("❌ Ошибка: пользователь не найден")
+        return
+        
+    correct_user_id = user_row[0]
+    
+    # Теперь используем правильный user_id для поиска купонов
     cursor.execute("""
-        SELECT uc.coupon_code, p.description, s.name, s.address, uc.created_at, p.valid_days
+        SELECT uc.coupon_code, p.description, s.name, s.address, uc.created_at, p.valid_days, p.starts_today
         FROM user_coupons uc
         JOIN promotions p ON uc.promotion_id = p.id
         JOIN stores s ON p.store_id = s.id
         WHERE uc.user_id = ? AND uc.redeemed = 0
         ORDER BY uc.created_at DESC
-    """, (user_id,))
+    """, (correct_user_id,))
+    
     active_coupons = cursor.fetchall()
     conn.close()
 
@@ -417,19 +439,33 @@ async def my_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
         store_name = coupon[2]
         store_address = coupon[3]
         created_at = datetime.strptime(coupon[4], '%Y-%m-%d %H:%M:%S').date()
-        valid_days = coupon[5] # Получаем valid_days
-        # ВЫЧИСЛЯЕМ дату истечения срока действия
+        valid_days = coupon[5]
+        starts_today = coupon[6]
         valid_until = created_at + timedelta(days=valid_days)
+        
+        # НОВОЕ: Определяем статус доступности акции
+        today = datetime.now().date()
+        if starts_today:
+            # Если акция стартует день в день - всегда активна
+            availability_status = "✅ Акция активна"
+        else:
+            # Если акция стартует на следующий день
+            if today > created_at:
+                # Прошел как минимум один день - акция активна
+                availability_status = "✅ Акция активна"
+            else:
+                # Сегодня получили акцию, но она стартует завтра
+                availability_status = "⏳ Акцией можно воспользоваться с завтрашнего дня!"
 
         await update.message.reply_text(
             f"🎁 {description}\n"
             f"🏪 \"Фасоль\", {store_address}\n"
             f"🔢 Код: <b>{coupon_code}</b>\n"
             f"📅 Дата получения: {created_at.strftime('%d.%m.%Y')}\n"
-            f"⏳ Купон можно погасить до: {valid_until.strftime('%d.%m.%Y')}\n", # НОВАЯ СТРОКА
+            f"⏳ Купон можно погасить до: {valid_until.strftime('%d.%m.%Y')}\n"
+            f"📊 Статус: {availability_status}",
             parse_mode="HTML"
         )
-
 
 async def my_store(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать информацию о моем магазине"""
@@ -501,7 +537,6 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, a
     else:
         await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
-# ИСПРАВЛЕНО: Функция для показа статистики магазина, доступна как мастер-админу, так и админу магазина
 async def show_store_stats_for_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Статистика конкретного магазина"""
     user_id = update.effective_user.id
@@ -556,8 +591,6 @@ async def show_store_stats_for_master(update: Update, context: ContextTypes.DEFA
     )
     conn.close()
     await update.message.reply_text(stats_text)
-
-# main.py (фрагмент)
 
 async def show_general_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Общая статистика для мастер-админа с изменением клавиатуры"""
@@ -633,8 +666,6 @@ async def show_general_stats(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # Сохраняем состояние, что мастер смотрит статистику
     MASTER_VIEWING_STATS[user_id] = True
     await update.message.reply_text(stats_text, parse_mode="HTML", reply_markup=reply_markup)
-
-    
 
 async def show_store_stats_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать список магазинов со статистикой за текущий месяц"""
@@ -745,12 +776,14 @@ async def show_my_promotions(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text("❌ Магазин не выбран.")
             return
         store_id = MASTER_ADMIN_SELECTED_STORE[user_id]
-        promotions = get_promotions(store_id)
+        # ИСПРАВЛЕНО: используем новую функцию с локальными ID
+        promotions = get_promotions_with_local_ids(store_id)
         store = get_store(store_id)
         title = f"🎁 <b>Акции магазина {store['name']}</b>"
     else:
         store_id = admin[4] if len(admin) > 4 else None
-        promotions = get_promotions(store_id)
+        # ИСПРАВЛЕНО: используем новую функцию с локальными ID
+        promotions = get_promotions_with_local_ids(store_id)
         store = get_store(store_id)
         title = f"🎁 <b>Акции магазина {store['name']}</b>"
 
@@ -766,8 +799,15 @@ async def show_my_promotions(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     promo_text = f"{title}\n\n"
     for promo in promotions:
-        # ОБНОВЛЕННАЯ РАСПАКОВКА: теперь 8 полей вместо 6
-        promo_id, store_id_promo, description, start_date, duration, max_coupons, valid_days, created_at = promo
+        # ИСПРАВЛЕНО: используем локальный ID для отображения
+        local_id = promo['local_id']  # Локальный ID для отображения
+        promo_id = promo['id']        # Глобальный ID для запросов к БД
+        description = promo['description']
+        start_date = promo['start_date']
+        duration = promo['duration']
+        max_coupons = promo['max_coupons']
+        valid_days = promo['valid_days']
+        starts_today = promo['starts_today']
         
         # ПОДСЧЕТ ВЫДАННЫХ КУПОНОВ ДЛЯ ЭТОЙ АКЦИИ
         cursor.execute("""
@@ -798,15 +838,19 @@ async def show_my_promotions(update: Update, context: ContextTypes.DEFAULT_TYPE)
         today = datetime.now().date()
         status = "🟢 Активна" if start_dt <= today <= end_dt else "🔴 Неактивна"
         
-        # ОБНОВЛЕННАЯ ИНФОРМАЦИЯ С ДОБАВЛЕНИЕМ ПОГАШЕННЫХ КУПОНОВ
+        # Определяем тип старта для отображения
+        start_type = "День в день" if starts_today else "На следующий день"
+        
+        # ОБНОВЛЕННАЯ ИНФОРМАЦИЯ С ЛОКАЛЬНЫМ ID
         promo_text += (
-            f"ID: {promo_id}\n"
+            f"ID: {local_id}\n"  # ИСПРАВЛЕНО: показываем локальный ID
             f"🎁 Описание: {description}\n"
             f"📅 Период акции: {start_dt.strftime('%d.%m.%Y')} - {end_dt.strftime('%d.%m.%Y')}\n"
+            f"⏰ Тип старта: {start_type}\n"
             f"📊 Макс. купонов: {max_coupons if max_coupons > 0 else '∞'}\n"
             f"📨 Выдано купонов: {issued_coupons}\n"
-            f"✅ Погашено: {redeemed_coupons}\n"  # <-- НОВАЯ СТРОКА
-            f"📈 Процент погашения: {redemption_percentage}%\n"  # <-- НОВАЯ СТРОКА
+            f"✅ Погашено: {redeemed_coupons}\n"
+            f"📈 Процент погашения: {redemption_percentage}%\n"
             f"⏳ Срок действия купона: {valid_days} дн.\n"
             f"📊 Статус: {status}\n"
             "━━━━━━━━━━━━━━━━\n"
@@ -835,14 +879,14 @@ async def add_promotion_start_for_master(update: Update, context: ContextTypes.D
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "📝 ДОБАВЛЕНИЕ АКЦИИ\n\n"
-        "Шаг 1 из 5: Введите описание акции\n"
+        "Шаг 1 из 6: Введите описание акции\n"
         "Например: 🍫 Шоколадка Snickers в подарок",
         reply_markup=reply_markup
     )
     USER_STATES[user_id] = "adding_promotion_description"
 
 async def delete_promotion_start_for_master(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало удаления акции мастер-админом из выбранного магазина"""
+    """Начало удаления акции мастер-админом из выбранного магазина с локальными ID"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_SESSIONS or ADMIN_SESSIONS[user_id][3] != "master":
         await update.message.reply_text("❌ Доступ запрещен.")
@@ -853,7 +897,8 @@ async def delete_promotion_start_for_master(update: Update, context: ContextType
         return
         
     store_id = MASTER_ADMIN_SELECTED_STORE[user_id]
-    promotions = get_promotions(store_id)
+    # ИСПРАВЛЕНО: используем новую функцию с локальными ID
+    promotions = get_promotions_with_local_ids(store_id)
 
     if not promotions:
         await update.message.reply_text("❌ Нет акций для удаления")
@@ -861,11 +906,11 @@ async def delete_promotion_start_for_master(update: Update, context: ContextType
 
     keyboard = [[KeyboardButton("🔙 Назад")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    promo_text = "❌ УДАЛЕНИЕ АКЦИИ\n\nВведите ID акции для удаления:\n\n"
+    promo_text = "❌ УДАЛЕНИЕ АКЦИИ\n\nВведите ЛОКАЛЬНЫЙ ID акции для удаления:\n\n"
     for promo in promotions:
-        # ОБНОВЛЕННАЯ РАСПАКОВКА: 8 полей вместо 6
-        promo_id, store_id_promo, description, start_date, duration, max_coupons, valid_days, created_at = promo
-        promo_text += f"ID: {promo_id} - {description}\n"
+        local_id = promo['local_id']  # ИСПРАВЛЕНО: используем локальный ID
+        description = promo['description']
+        promo_text += f"ID: {local_id} - {description}\n"
     await update.message.reply_text(promo_text, reply_markup=reply_markup)
     USER_STATES[user_id] = "deleting_promotion"
 
@@ -888,14 +933,14 @@ async def add_promotion_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
     await update.message.reply_text(
         "📝 ДОБАВЛЕНИЕ АКЦИИ\n\n"
-        "Шаг 1 из 5: Введите описание акции\n"
+        "Шаг 1 из 6: Введите описание акции\n"
         "Например: 🍫 Шоколадка Snickers в подарок",
         reply_markup=reply_markup
     )
     USER_STATES[user_id] = "adding_promotion_description"
 
 async def delete_promotion_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Начало удаления акции (для админа магазина)"""
+    """Начало удаления акции (для админа магазина) с локальными ID"""
     user_id = update.effective_user.id
     if user_id not in ADMIN_SESSIONS:
         await update.message.reply_text("❌ Сначала войдите в админ-панель")
@@ -909,7 +954,8 @@ async def delete_promotion_start(update: Update, context: ContextTypes.DEFAULT_T
         return
         
     store_id = admin[4] if len(admin) > 4 else None
-    promotions = get_promotions(store_id)
+    # ИСПРАВЛЕНО: используем новую функцию с локальными ID
+    promotions = get_promotions_with_local_ids(store_id)
 
     if not promotions:
         await update.message.reply_text("❌ Нет акций для удаления")
@@ -917,11 +963,11 @@ async def delete_promotion_start(update: Update, context: ContextTypes.DEFAULT_T
 
     keyboard = [[KeyboardButton("🔙 Назад")]]
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-    promo_text = "❌ УДАЛЕНИЕ АКЦИИ\n\nВведите ID акции для удаления:\n\n"
+    promo_text = "❌ УДАЛЕНИЕ АКЦИИ\n\nВведите ЛОКАЛЬНЫЙ ID акции для удаления:\n\n"
     for promo in promotions:
-        # ОБНОВЛЕННАЯ РАСПАКОВКА: 8 полей вместо 6
-        promo_id, store_id_promo, description, start_date, duration, max_coupons, valid_days, created_at = promo
-        promo_text += f"ID: {promo_id} - {description}\n"
+        local_id = promo['local_id']  # ИСПРАВЛЕНО: используем локальный ID
+        description = promo['description']
+        promo_text += f"ID: {local_id} - {description}\n"
     await update.message.reply_text(promo_text, reply_markup=reply_markup)
     USER_STATES[user_id] = "deleting_promotion"
 
@@ -1064,7 +1110,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
                     
                 # Если пользователь находился на этапе добавления акции
-                elif state in ["adding_promotion_description", "adding_promotion_date", "adding_promotion_duration", "adding_promotion_max_coupons", "adding_promotion_valid_days"]:
+                elif state in ["adding_promotion_description", "adding_promotion_date", "adding_promotion_duration", "adding_promotion_max_coupons", "adding_promotion_valid_days", "adding_promotion_start_type"]:
                     if user_id in USER_STATES:
                         del USER_STATES[user_id]
                     # Возвращаем в админ-панель
@@ -1254,22 +1300,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard = [[KeyboardButton("🔙 Назад")]]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             await update.message.reply_text(
-                "📅 Шаг 2 из 5: Введите дату начала акции\n"
+                "📅 Шаг 2 из 6: Введите дату начала акции\n"
                 "Формат: ДД.ММ.ГГГГ\n"
-                "Например: 22.08.2025", # Обновлено
+                "Например: 22.08.2025",
                 reply_markup=reply_markup
             )
             USER_STATES[user_id] = "adding_promotion_date"
         elif state == "adding_promotion_date":
             try:
-              # Проверяем новый формат ДД-ММ-ГГГГ
                 datetime.strptime(text, '%d.%m.%Y')
                 context.user_data['promo_start_date'] = text
                 keyboard = [[KeyboardButton("🔙 Назад")]]
                 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
                 await update.message.reply_text(
-                    "⏰ Шаг 3 из 5: Введите продолжительность акции в днях\n"
-                    "Например: 7", # Обновлено
+                    "⏰ Шаг 3 из 6: Введите продолжительность акции в днях\n"
+                    "Например: 7",
                     reply_markup=reply_markup
                 )
                 USER_STATES[user_id] = "adding_promotion_duration"
@@ -1285,7 +1330,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
                 # НОВЫЙ ШАГ: Запрос макс. количества купонов
                 await update.message.reply_text(
-                    "📊 Шаг 4 из 5: Введите максимальное количество купонов по этой акции\n"
+                    "📊 Шаг 4 из 6: Введите максимальное количество купонов по этой акции\n"
                     "Введите 0, если лимит не нужен (безлимитная акция)\n"
                     "Например: 100",
                     reply_markup=reply_markup
@@ -1303,7 +1348,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
                 # НОВЫЙ ШАГ: Запрос срока действия купона
                 await update.message.reply_text(
-                    "⏰ Шаг 5 из 5: Введите количество дней, в течение которых купон будет действителен после получения\n"
+                    "⏰ Шаг 5 из 6: Введите количество дней, в течение которых купон будет действителен после получения\n"
                     "Например: 3",
                     reply_markup=reply_markup
                 )
@@ -1316,6 +1361,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if valid_days <= 0:
                     raise ValueError
 
+                context.user_data['promo_valid_days'] = valid_days
+                keyboard = [
+                    [KeyboardButton("✅ День в день"), KeyboardButton("⏳ На следующий день")],
+                    [KeyboardButton("🔙 Назад")]
+                ]
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+                
+                # НОВЫЙ ШАГ: Выбор типа старта акции
+                await update.message.reply_text(
+                    "🚀 Шаг 6 из 6: Выберите, когда акция становится доступной для использования:\n\n"
+                    "✅ День в день - пользователь может воспользоваться акцией сразу после получения\n"
+                    "⏳ На следующий день - пользователь сможет воспользоваться акцией только со следующего дня",
+                    reply_markup=reply_markup
+                )
+                USER_STATES[user_id] = "adding_promotion_start_type"
+            except ValueError:
+                await update.message.reply_text("❌ Введите число (количество дней, больше 0)")
+        
+        elif state == "adding_promotion_start_type":
+            # Обработка выбора типа старта
+            if text in ["✅ День в день", "⏳ На следующий день"]:
+                starts_today = 1 if text == "✅ День в день" else 0
+                
                 # Получаем все собранные данные
                 admin = ADMIN_SESSIONS[user_id]
                 role = admin[3]
@@ -1323,6 +1391,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 start_date = context.user_data['promo_start_date']
                 duration = context.user_data['promo_duration']
                 max_coupons = context.user_data['promo_max_coupons']
+                valid_days = context.user_data['promo_valid_days']
 
                 if role == "master":
                     if user_id not in MASTER_ADMIN_SELECTED_STORE:
@@ -1333,27 +1402,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     store_id = admin[4] if len(admin) > 4 else None
 
-                # СОЗДАЕМ акцию с ВСЕМИ параметрами
-                create_promotion(store_id, description, start_date, duration, max_coupons, valid_days)
+                # СОЗДАЕМ акцию с ВСЕМИ параметрами, включая starts_today
+                create_promotion(store_id, description, start_date, duration, max_coupons, valid_days, starts_today)
                 store = get_store(store_id)
+                
+                start_type_text = "день в день" if starts_today else "на следующий день"
                 success_msg = (f"✅ Акция успешно создана!\n\n"
                                f"🏪 Магазин: {store['name']}\n"
                                f"🎁 Акция: {description}\n"
                                f"📅 Длительность акции: {duration} дн.\n"
                                f"📊 Макс. купонов: {max_coupons if max_coupons > 0 else '∞'}\n"
-                               f"⏳ Срок действия купона: {valid_days} дн.")
+                               f"⏳ Срок действия купона: {valid_days} дн.\n"
+                               f"🚀 Старт акции: {start_type_text}")
+                
                 del USER_STATES[user_id]
                 if role == "master":
                     await show_selected_store_menu(update, context, store_id)
                 else:
                     await update.message.reply_text(success_msg)
-            except ValueError:
-                await update.message.reply_text("❌ Введите число (количество дней, больше 0)")
+            else:
+                await update.message.reply_text("❌ Пожалуйста, выберите один из предложенных вариантов")
+                
         elif state == "deleting_promotion":
             try:
-                promo_id = int(text)
+                local_id = int(text)  # Локальный ID, который ввел пользователь
+                
+                # Получаем информацию о текущем магазине
                 admin = ADMIN_SESSIONS[user_id]
                 role = admin[3]
+                
                 if role == "master":
                     if user_id not in MASTER_ADMIN_SELECTED_STORE:
                         await update.message.reply_text("❌ Ошибка: магазин не выбран.")
@@ -1363,27 +1440,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     store_id = admin[4] if len(admin) > 4 else None
 
+                # ИСПРАВЛЕНО: находим глобальный ID по локальному
+                promotions = get_promotions_with_local_ids(store_id)
+                target_promo = None
+                
+                for promo in promotions:
+                    if promo['local_id'] == local_id:
+                        target_promo = promo
+                        break
+                
+                if not target_promo:
+                    await update.message.reply_text("❌ Акция с таким локальным ID не найдена")
+                    return
+                    
+                global_id = target_promo['id']  # Настоящий ID для операции в БД
+
+                # Проверяем существование акции (дополнительная проверка)
                 conn = sqlite3.connect('fasoley_bot.db')
                 cursor = conn.cursor()
-                cursor.execute("SELECT * FROM promotions WHERE id = ? AND store_id = ?", (promo_id, store_id))
+                cursor.execute("SELECT * FROM promotions WHERE id = ? AND store_id = ?", (global_id, store_id))
                 promo = cursor.fetchone()
                 if not promo:
                     await update.message.reply_text("❌ Акция не найдена или у вас нет прав на её удаление")
                     conn.close()
                     return
-                cursor.execute("DELETE FROM promotions WHERE id = ?", (promo_id,))
+                    
+                # Удаляем по глобальному ID
+                cursor.execute("DELETE FROM promotions WHERE id = ?", (global_id,))
                 conn.commit()
                 conn.close()
-                success_msg = f"✅ Акция ID:{promo_id} успешно удалена!"
+                
+                success_msg = f"✅ Акция ID:{local_id} успешно удалена!"
                 del USER_STATES[user_id]
+                
                 # Возвращаем в соответствующее меню
                 if role == "master":
                     await show_selected_store_menu(update, context, store_id)
                 else:
-                    # Для store-admin просто отправляем сообщение об успехе, НЕ показываем всю панель
+                    # Для store-admin просто отправляем сообщение об успехе
                     await update.message.reply_text(success_msg)
+                    
             except ValueError:
-                await update.message.reply_text("❌ Введите корректный ID акции")
+                await update.message.reply_text("❌ Введите корректный ЛОКАЛЬНЫЙ ID акции (число)")
 
         # ========== НОВЫЕ СОСТОЯНИЯ ДЛЯ УПРАВЛЕНИЯ МАГАЗИНАМИ ==========
         elif state == "adding_store_city":
