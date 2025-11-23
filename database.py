@@ -188,6 +188,7 @@ def get_promotions(store_id=None):
 def get_promotions_with_local_ids(store_id=None):
     """Получить акции с локальными ID для каждого магазина"""
     conn = get_db_connection()
+    conn.row_factory = sqlite3.Row  # ДОБАВЛЕНО: устанавливаем row_factory для доступа по ключам
     
     if store_id:
         # Для конкретного магазина - локальная нумерация с 1
@@ -210,7 +211,7 @@ def get_promotions_with_local_ids(store_id=None):
         rows = conn.execute(query).fetchall()
     
     conn.close()
-    return [dict(row) for row in rows]    
+    return [dict(row) for row in rows]  
 
 def create_promotion(store_id, description, start_date, duration, max_coupons=0, valid_days=1, starts_today=1):
     # Преобразуем ДД.ММ.ГГГГ в ГГГГ-ММ-ДД для хранения в БД

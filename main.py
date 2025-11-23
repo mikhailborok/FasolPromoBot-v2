@@ -53,7 +53,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         # --- Отправка изображения с подписью ---
-        photo_path = "/content/drive/MyDrive/FasolPromoBotQwen/Fasol.png" # Убедитесь, что путь правильный
+        photo_path = "Fasol.png"
         
         # Проверяем, существует ли файл
         if os.path.exists(photo_path):
@@ -95,7 +95,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
         
         # --- Отправка изображения с подписью для нового пользователя ---
-        photo_path = "/content/drive/MyDrive/FasolPromoBotQwen/Fasol.png" # Убедитесь, что путь правильный
+        photo_path = "Fasol.png"
         
         # Проверяем, существует ли файл
         if os.path.exists(photo_path):
