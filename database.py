@@ -140,6 +140,25 @@ def init_db():
 
     conn.commit()
     conn.close()
+    update_database_schema()
+
+def update_database_schema():
+    """Обновляет структуру базы данных при изменениях"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    
+    # Проверяем и добавляем отсутствующие колонки
+    cursor.execute("PRAGMA table_info(promotions)")
+    columns = [col[1] for col in cursor.fetchall()]
+    
+    # Добавляем starts_today если нет
+    if 'starts_today' not in columns:
+        print("🔧 Добавляем колонку starts_today в таблицу promotions...")
+        cursor.execute('ALTER TABLE promotions ADD COLUMN starts_today BOOLEAN DEFAULT 1')
+    
+    conn.commit()
+    conn.close()
+    print("✅ Структура БД обновлена!")    
 
 # Функции доступа к данным
 def get_user(telegram_id):
