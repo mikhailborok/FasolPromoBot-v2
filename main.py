@@ -6,6 +6,8 @@ import os
 import json
 from io import BytesIO
 import re
+import random  
+import asyncio  
 
 # Импорт из telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, InputFile
@@ -294,105 +296,6 @@ async def show_selected_store_menu(update: Update, context: ContextTypes.DEFAULT
         await context.bot.send_message(chat_id=user_id, text="Выберите действие:", reply_markup=reply_markup)
     else: # Предполагаем, что это вызов из handle_message
         await update.message.reply_text(menu_text, reply_markup=reply_markup)
-
-async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получение акции"""
-    user_id = update.effective_user.id
-    store_id = get_user(user_id)
-    if not store_id:
-        await update.message.reply_text("❌ Сначала выберите магазин!")
-        await choose_store(update, context)
-        return
-
-    # Проверяем, получал ли пользователь *любой* купон сегодня (погашен или нет)
-    today = datetime.now().date().isoformat()
-    conn = sqlite3.connect('fasoley_bot.db')
-    cursor = conn.cursor()
-    
-    # Сначала находим правильный user_id (id из таблицы users)
-    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,))
-    user_row = cursor.fetchone()
-    
-    if not user_row:
-        conn.close()
-        await update.message.reply_text("❌ Ошибка: пользователь не найден")
-        return
-        
-    correct_user_id = user_row[0]
-    
-    # Теперь проверяем купоны по правильному user_id
-    cursor.execute("""
-        SELECT 1 FROM user_coupons 
-        WHERE user_id = ? AND DATE(created_at) = ?
-        LIMIT 1
-    """, (correct_user_id, today))
-    existing_coupon_today = cursor.fetchone()
-    
-    if existing_coupon_today:
-        conn.close()
-        await update.message.reply_text("❌ Вы уже получили акцию сегодня! Приходите завтра 😊")
-        return
-
-    promotions = get_promotions(store_id)
-    active_promotions = []
-    today_date = datetime.now().date()
-    
-    for promo in promotions:
-        # promo[3] - start_date, promo[4] - duration, promo[5] - max_coupons, promo[6] - valid_days, promo[7] - starts_today
-        try:
-            start_date = datetime.strptime(promo[3], '%d.%m.%Y').date()
-        except ValueError:
-            try:
-                start_date = datetime.strptime(promo[3], '%Y-%m-%d').date()
-            except ValueError:
-                continue
-        
-        end_date = start_date + timedelta(days=promo[4])
-        
-        # НОВАЯ ПРОВЕРКА: Не превышен ли лимит купонов по акции?
-        cursor.execute("""
-            SELECT COUNT(*) FROM user_coupons 
-            WHERE promotion_id = ?
-        """, (promo[0],))
-        coupons_issued = cursor.fetchone()[0]
-        max_allowed = promo[5] # max_coupons
-        
-        # Активна, если дата подходит И (лимит не установлен (0) ИЛИ лимит не превышен)
-        if start_date <= today_date <= end_date and (max_allowed == 0 or coupons_issued < max_allowed):
-            active_promotions.append(promo)
-
-    conn.close() # Закрываем соединение после проверки лимитов
-
-    if not active_promotions:
-        await update.message.reply_text("😔 В данный момент нет активных акций в вашем магазине")
-        return
-
-    import random
-    selected_promo = random.choice(active_promotions)
-    coupon_code = create_coupon(user_id, selected_promo)
-
-    store = get_store(store_id)
-    # Вычисляем дату, до которой можно погасить купон
-    valid_until_date = today_date + timedelta(days=selected_promo[6]) # valid_days
-    
-    # НОВОЕ: Определяем сообщение о доступности акции
-    starts_today = selected_promo[7] # starts_today
-    if starts_today:
-        availability_message = "✅ Акцией можно воспользоваться уже сейчас!"
-    else:
-        availability_message = "⏳ Акцией можно воспользоваться с завтрашнего дня!"
-    
-    await update.message.reply_text(
-        f"🎉 Поздравляем! Вы получили акцию в магазине \"Фасоль\":\n\n"
-        f"🎁 {selected_promo[2]}\n"
-        f"📍 Адрес: {store['address']}\n"
-        f"📅 Дата выдачи: {today_date.strftime('%d.%m.%Y')}\n"
-        f"⏳ Купон действителен до: {valid_until_date.strftime('%d.%m.%Y')}\n"
-        f"{availability_message}\n\n"
-        f"🔢 Ваш код купона: <b>{coupon_code}</b>\n"
-        f"Покажите этот код на кассе для получения скидки/подарка! 📱",
-        parse_mode="HTML"
-    )
 
 async def my_coupons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показать мои купоны"""
@@ -1283,7 +1186,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"🏪 Магазин: {result['store_name']}\n"
                             f"📍 Адрес: {result['address']}, {result['city']}\n"
                             f"🔢 Код: {result['code']}\n"
-                            f"⏰ Время погашения: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
                         )
                         await context.bot.send_message(
                             chat_id=owner_telegram_id,
@@ -1672,6 +1574,123 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await add_promotion_start(update, context)
             elif text == "❌ Удалить акцию":
                 await delete_promotion_start(update, context)
+
+# ========== АНИМИРОВАННАЯ РУЛЕТКА АКЦИЙ ==========
+
+async def animated_promotion_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    store_id = get_user(user_id)
+    if not store_id:
+        await update.message.reply_text("❌ Сначала выберите магазин!")
+        await choose_store(update, context)
+        return
+
+    # Проверка лимита: 1 купон в день
+    today = datetime.now().date().isoformat()
+    conn = sqlite3.connect('fasoley_bot.db')
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users WHERE telegram_id = ?", (user_id,))
+    user_row = cursor.fetchone()
+    if user_row:
+        correct_user_id = user_row[0]
+        cursor.execute("SELECT 1 FROM user_coupons WHERE user_id = ? AND DATE(created_at) = ? LIMIT 1", (correct_user_id, today))
+        if cursor.fetchone():
+            conn.close()
+            await update.message.reply_text("❌ Вы уже получили акцию сегодня! Приходите завтра 😊")
+            return
+
+    # Получаем активные акции
+    promotions = get_promotions(store_id)
+    active_promotions = []
+    today_date = datetime.now().date()
+    for promo in promotions:
+        try:
+            start_date = datetime.strptime(promo[3], '%d.%m.%Y').date()
+        except ValueError:
+            try:
+                start_date = datetime.strptime(promo[3], '%Y-%m-%d').date()
+            except ValueError:
+                continue
+        end_date = start_date + timedelta(days=promo[4])
+        cursor.execute("SELECT COUNT(*) FROM user_coupons WHERE promotion_id = ?", (promo[0],))
+        coupons_issued = cursor.fetchone()[0]
+        max_allowed = promo[5]
+        if start_date <= today_date <= end_date and (max_allowed == 0 or coupons_issued < max_allowed):
+            active_promotions.append(promo)
+    conn.close()
+
+    if not active_promotions:
+        await update.message.reply_text("😔 В данный момент нет активных акций в вашем магазине")
+        return
+
+    # === ЭТАП 1: БЫСТРОЕ ВРАЩЕНИЕ — РОВНО 4 СЕКУНДЫ (10 кадров × 0.4 сек) ===
+    spin_emojis = ["🎰", "🎯", "🔄", "✨", "⭐", "💫", "🌟", "⚡"]
+    animation_pool = active_promotions * 5
+    random.shuffle(animation_pool)
+
+    msg = await update.message.reply_text(
+        "🎰 *ЗАПУСК АКЦИОННОЙ РУЛЕТКИ*\n🔄 Подбираем лучшие предложения...",
+        parse_mode="Markdown"
+    )
+    await asyncio.sleep(1.0)
+
+    for i in range(10):  # 10 кадров = 4 секунды при задержке 0.4 сек
+        promo = random.choice(animation_pool)
+        desc = (promo[2][:28] + "...") if len(promo[2]) > 30 else promo[2]
+        emoji = spin_emojis[i % len(spin_emojis)]
+        spin_text = f"🎰 *РУЛЕТКА АКЦИЙ КРУТИТСЯ...*\n{emoji} *{desc}*"
+        try:
+            await msg.edit_text(spin_text, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Не удалось обновить анимацию: {e}")
+        await asyncio.sleep(0.4)
+
+    # === ЭТАП 2: АНИМАЦИЯ ВЫИГРЫША (БЕЗ ИЗМЕНЕНИЙ) ===
+    final_promo = random.choice(active_promotions)
+    coupon_code = create_coupon(user_id, final_promo)
+
+    color_emojis = [
+        "🟥🔴🎈",  # Красный
+        "🟧🟠🍊",  # Оранжевый
+        "🟨💛🌟",  # Желтый
+        "🟩💚🍀",  # Зеленый
+        "🟦💙🌀",  # Синий
+        "🟪💜☂️",  # Фиолетовый
+    ]
+    for i in range(7):
+        color_combo = color_emojis[i % len(color_emojis)]
+        winner_display = (
+            f"{color_combo} *ВАШ ПРИЗ* {color_combo}\n"
+            f"🎁 *{final_promo[2]}*"
+        )
+        await msg.edit_text(winner_display, parse_mode="Markdown")
+        await asyncio.sleep(0.4)
+
+    # === ЭТАП 3: ФИНАЛЬНОЕ СООБЩЕНИЕ ===
+    store = get_store(store_id)
+    valid_until = today_date + timedelta(days=final_promo[6])
+    starts_today = final_promo[7]
+    availability = "✅ Акцией можно воспользоваться уже сейчас!" if starts_today else "⏳ Акцией можно воспользоваться с завтрашнего дня!"
+
+    final_text = (
+        f"🎉 Поздравляем! Вы получили акцию в магазине \"Фасоль\":\n"
+        f"🎁 <b>{final_promo[2]}</b>\n"
+        f"📍 Адрес: {store['address']}\n"
+        f"📅 Дата выдачи: {today_date.strftime('%d.%m.%Y')}\n"
+        f"⏳ Купон действителен до: {valid_until.strftime('%d.%m.%Y')}\n"
+        f"{availability}\n"
+        f"🔢 Ваш код купона: <b>{coupon_code}</b>\n"
+        f"Покажите этот код на кассе для получения скидки/подарка! 📱"
+    )
+    await msg.edit_text(final_text, parse_mode="HTML")
+
+
+# ЗАМЕНЯЕМ старую функцию get_promotion на анимированную версию
+async def get_promotion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Анимированное получение акции через рулетку"""
+    await animated_promotion_roulette(update, context)
+
+# ========== КОНЕЦ АНИМИРОВАННОЙ РУЛЕТКИ ==========
 
 
 def main():
